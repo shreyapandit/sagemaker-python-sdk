@@ -24,7 +24,7 @@ from packaging.version import Version
 
 from sagemaker import Session, image_uris, utils
 from sagemaker.local import LocalSession
-from sagemaker.workflow.pipeline_context import PipelineSession
+from sagemaker.workflow.pipeline_context import PipelineSession, LocalPipelineSession
 
 DEFAULT_REGION = "us-west-2"
 CUSTOM_BUCKET_NAME_PREFIX = "sagemaker-custom-bucket"
@@ -46,6 +46,7 @@ NO_P3_REGIONS = [
     "ca-central-1",  # it has p3, but not enough
     "eu-central-1",  # it has p3, but not enough
     "eu-north-1",
+    "eu-west-1",  # it has p3, but not enough
     "eu-west-2",  # it has p3, but not enough
     "eu-west-3",
     "eu-south-1",
@@ -161,6 +162,11 @@ def pipeline_session(boto_session):
     return PipelineSession(boto_session=boto_session)
 
 
+@pytest.fixture(scope="session")
+def local_pipeline_session(boto_session):
+    return LocalPipelineSession(boto_session=boto_session)
+
+
 @pytest.fixture(scope="module")
 def custom_bucket_name(boto_session):
     region = boto_session.region_name
@@ -181,6 +187,8 @@ def mxnet_inference_py_version(mxnet_inference_version, request):
         return request.param
     elif Version(mxnet_inference_version) == Version("1.8.0"):
         return "py37"
+    elif Version(mxnet_inference_version) == Version("1.9.0"):
+        return "py38"
     else:
         return "py3"
 
@@ -191,6 +199,8 @@ def mxnet_training_py_version(mxnet_training_version, request):
         return request.param
     elif Version(mxnet_training_version) == Version("1.8.0"):
         return "py37"
+    elif Version(mxnet_training_version) == Version("1.9.0"):
+        return "py38"
     else:
         return "py3"
 
@@ -242,25 +252,44 @@ def huggingface_pytorch_training_py_version(huggingface_pytorch_training_version
 
 @pytest.fixture(scope="module")
 def huggingface_training_compiler_pytorch_version(huggingface_training_compiler_version):
-    return _huggingface_base_fm_version(
+    versions = _huggingface_base_fm_version(
         huggingface_training_compiler_version, "pytorch", "huggingface_training_compiler"
-    )[0]
+    )
+    if not versions:
+        pytest.skip(
+            f"Hugging Face Training Compiler version {huggingface_training_compiler_version} does "
+            f"not have a PyTorch release."
+        )
+    return versions[0]
 
 
 @pytest.fixture(scope="module")
 def huggingface_training_compiler_tensorflow_version(huggingface_training_compiler_version):
-    return _huggingface_base_fm_version(
+    versions = _huggingface_base_fm_version(
         huggingface_training_compiler_version, "tensorflow", "huggingface_training_compiler"
-    )[0]
+    )
+    if not versions:
+        pytest.skip(
+            f"Hugging Face Training Compiler version {huggingface_training_compiler_version} "
+            f"does not have a TensorFlow release."
+        )
+    return versions[0]
 
 
 @pytest.fixture(scope="module")
-def huggingface_training_compiler_py_version(huggingface_training_compiler_tensorflow_version):
+def huggingface_training_compiler_tensorflow_py_version(
+    huggingface_training_compiler_tensorflow_version,
+):
     return (
         "py37"
         if Version(huggingface_training_compiler_tensorflow_version) < Version("2.6")
         else "py38"
     )
+
+
+@pytest.fixture(scope="module")
+def huggingface_training_compiler_pytorch_py_version(huggingface_training_compiler_pytorch_version):
+    return "py38"
 
 
 @pytest.fixture(scope="module")
@@ -404,6 +433,18 @@ def tf_full_py_version(tf_full_version):
     if version < Version("2.8"):
         return "py38"
     return "py39"
+
+
+@pytest.fixture(scope="module")
+def pytorch_ddp_py_version():
+    return "py3"
+
+
+@pytest.fixture(
+    scope="module", params=["1.10", "1.10.0", "1.10.2", "1.11", "1.11.0", "1.12", "1.12.0"]
+)
+def pytorch_ddp_framework_version(request):
+    return request.param
 
 
 @pytest.fixture(scope="session")

@@ -11,6 +11,7 @@
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
 from __future__ import absolute_import
+from copy import deepcopy
 
 import logging
 import json
@@ -22,7 +23,7 @@ from sagemaker.fw_utils import UploadedCode
 
 import pytest
 from botocore.exceptions import ClientError
-from mock import ANY, MagicMock, Mock, patch
+from mock import ANY, MagicMock, Mock, patch, PropertyMock
 from sagemaker.huggingface.estimator import HuggingFace
 from sagemaker.jumpstart.constants import JUMPSTART_BUCKET_NAME_SET, JUMPSTART_RESOURCE_BASE_NAME
 from sagemaker.jumpstart.enums import JumpStartTag
@@ -43,6 +44,7 @@ from sagemaker.async_inference import AsyncInferenceConfig
 from sagemaker.estimator import Estimator, EstimatorBase, Framework, _TrainingJob
 from sagemaker.fw_utils import PROFILER_UNSUPPORTED_REGIONS
 from sagemaker.inputs import ShuffleConfig
+from sagemaker.instance_group import InstanceGroup
 from sagemaker.model import FrameworkModel
 from sagemaker.mxnet.estimator import MXNet
 from sagemaker.predictor import Predictor
@@ -51,6 +53,8 @@ from sagemaker.sklearn.estimator import SKLearn
 from sagemaker.tensorflow.estimator import TensorFlow
 from sagemaker.predictor_async import AsyncPredictor
 from sagemaker.transformer import Transformer
+from sagemaker.workflow.parameters import ParameterString, ParameterBoolean
+from sagemaker.workflow.pipeline_context import PipelineSession
 from sagemaker.xgboost.estimator import XGBoost
 
 MODEL_DATA = "s3://bucket/model.tar.gz"
@@ -65,6 +69,7 @@ TIME = 1510006209.073025
 BUCKET_NAME = "mybucket"
 INSTANCE_COUNT = 1
 INSTANCE_TYPE = "c4.4xlarge"
+KEEP_ALIVE_PERIOD_IN_SECONDS = 1800
 ACCELERATOR_TYPE = "ml.eia.medium"
 ROLE = "DummyRole"
 IMAGE_URI = "fakeimage"
@@ -225,6 +230,24 @@ def sagemaker_session():
 
 
 @pytest.fixture()
+def pipeline_session():
+    client_mock = Mock()
+    client_mock._client_config.user_agent = (
+        "Boto3/1.14.24 Python/3.8.5 Linux/5.4.0-42-generic Botocore/1.17.24 Resource"
+    )
+    role_mock = Mock()
+    type(role_mock).arn = PropertyMock(return_value=ROLE)
+    resource_mock = Mock()
+    resource_mock.Role.return_value = role_mock
+    session_mock = Mock(region_name=REGION)
+    session_mock.resource.return_value = resource_mock
+    session_mock.client.return_value = client_mock
+    return PipelineSession(
+        boto_session=session_mock, sagemaker_client=client_mock, default_bucket=BUCKET_NAME
+    )
+
+
+@pytest.fixture()
 def training_job_description(sagemaker_session):
     returned_job_description = RETURNED_JOB_DESCRIPTION.copy()
     mock_describe_training_job = Mock(
@@ -302,6 +325,48 @@ def test_framework_all_init_args(sagemaker_session):
         "enable_sagemaker_metrics": True,
         "enable_network_isolation": True,
     }
+
+
+def test_framework_with_heterogeneous_cluster(sagemaker_session):
+    f = DummyFramework(
+        entry_point=SCRIPT_PATH,
+        role=ROLE,
+        sagemaker_session=sagemaker_session,
+        instance_groups=[
+            InstanceGroup("group1", "ml.c4.xlarge", 1),
+            InstanceGroup("group2", "ml.m4.xlarge", 2),
+        ],
+    )
+    f.fit("s3://mydata")
+    sagemaker_session.train.assert_called_once()
+    _, args = sagemaker_session.train.call_args
+    assert args["resource_config"]["InstanceGroups"][0] == {
+        "InstanceGroupName": "group1",
+        "InstanceCount": 1,
+        "InstanceType": "ml.c4.xlarge",
+    }
+    assert args["resource_config"]["InstanceGroups"][1] == {
+        "InstanceGroupName": "group2",
+        "InstanceCount": 2,
+        "InstanceType": "ml.m4.xlarge",
+    }
+
+
+def test_framework_with_keep_alive_period(sagemaker_session):
+    f = DummyFramework(
+        entry_point=SCRIPT_PATH,
+        role=ROLE,
+        sagemaker_session=sagemaker_session,
+        instance_groups=[
+            InstanceGroup("group1", "ml.c4.xlarge", 1),
+            InstanceGroup("group2", "ml.m4.xlarge", 2),
+        ],
+        keep_alive_period_in_seconds=KEEP_ALIVE_PERIOD_IN_SECONDS,
+    )
+    f.fit("s3://mydata")
+    sagemaker_session.train.assert_called_once()
+    _, args = sagemaker_session.train.call_args
+    assert args["resource_config"]["KeepAlivePeriodInSeconds"] == KEEP_ALIVE_PERIOD_IN_SECONDS
 
 
 def test_framework_with_debugger_and_built_in_rule(sagemaker_session):
@@ -678,6 +743,110 @@ def test_framework_with_no_default_profiler_in_unsupported_region(region):
     _, args = sms.train.call_args
     assert args.get("profiler_config") is None
     assert args.get("profiler_rule_configs") is None
+
+
+@pytest.mark.parametrize("region", PROFILER_UNSUPPORTED_REGIONS)
+def test_framework_with_debugger_config_set_up_in_unsupported_region(region):
+    with pytest.raises(ValueError) as error:
+        boto_mock = Mock(name="boto_session", region_name=region)
+        sms = MagicMock(
+            name="sagemaker_session",
+            boto_session=boto_mock,
+            boto_region_name=region,
+            config=None,
+            local_mode=False,
+            s3_client=None,
+            s3_resource=None,
+        )
+        f = DummyFramework(
+            entry_point=SCRIPT_PATH,
+            role=ROLE,
+            sagemaker_session=sms,
+            instance_count=INSTANCE_COUNT,
+            instance_type=INSTANCE_TYPE,
+            debugger_hook_config=DebuggerHookConfig(s3_output_path="s3://output"),
+        )
+        f.fit("s3://mydata")
+
+    assert "Current region does not support debugger but debugger hook config is set!" in str(error)
+
+
+@pytest.mark.parametrize("region", PROFILER_UNSUPPORTED_REGIONS)
+def test_framework_enable_profiling_in_unsupported_region(region):
+    with pytest.raises(ValueError) as error:
+        boto_mock = Mock(name="boto_session", region_name=region)
+        sms = MagicMock(
+            name="sagemaker_session",
+            boto_session=boto_mock,
+            boto_region_name=region,
+            config=None,
+            local_mode=False,
+            s3_client=None,
+            s3_resource=None,
+        )
+        f = DummyFramework(
+            entry_point=SCRIPT_PATH,
+            role=ROLE,
+            sagemaker_session=sms,
+            instance_count=INSTANCE_COUNT,
+            instance_type=INSTANCE_TYPE,
+        )
+        f.fit("s3://mydata")
+        f.enable_default_profiling()
+
+    assert "Current region does not support profiler / debugger!" in str(error)
+
+
+@pytest.mark.parametrize("region", PROFILER_UNSUPPORTED_REGIONS)
+def test_framework_update_profiling_in_unsupported_region(region):
+    with pytest.raises(ValueError) as error:
+        boto_mock = Mock(name="boto_session", region_name=region)
+        sms = MagicMock(
+            name="sagemaker_session",
+            boto_session=boto_mock,
+            boto_region_name=region,
+            config=None,
+            local_mode=False,
+            s3_client=None,
+            s3_resource=None,
+        )
+        f = DummyFramework(
+            entry_point=SCRIPT_PATH,
+            role=ROLE,
+            sagemaker_session=sms,
+            instance_count=INSTANCE_COUNT,
+            instance_type=INSTANCE_TYPE,
+        )
+        f.fit("s3://mydata")
+        f.update_profiler(system_monitor_interval_millis=1000)
+
+    assert "Current region does not support profiler / debugger!" in str(error)
+
+
+@pytest.mark.parametrize("region", PROFILER_UNSUPPORTED_REGIONS)
+def test_framework_disable_profiling_in_unsupported_region(region):
+    with pytest.raises(ValueError) as error:
+        boto_mock = Mock(name="boto_session", region_name=region)
+        sms = MagicMock(
+            name="sagemaker_session",
+            boto_session=boto_mock,
+            boto_region_name=region,
+            config=None,
+            local_mode=False,
+            s3_client=None,
+            s3_resource=None,
+        )
+        f = DummyFramework(
+            entry_point=SCRIPT_PATH,
+            role=ROLE,
+            sagemaker_session=sms,
+            instance_count=INSTANCE_COUNT,
+            instance_type=INSTANCE_TYPE,
+        )
+        f.fit("s3://mydata")
+        f.disable_profiling()
+
+    assert "Current region does not support profiler / debugger!" in str(error)
 
 
 def test_framework_with_profiler_config_and_profiler_disabled(sagemaker_session):
@@ -1287,6 +1456,68 @@ def test_invalid_custom_code_bucket(sagemaker_session):
     with pytest.raises(ValueError) as error:
         t.fit("s3://bucket/mydata")
     assert "Expecting 's3' scheme" in str(error)
+
+
+def test_get_instance_type_gpu(sagemaker_session):
+    estimator = Estimator(
+        image_uri="some-image",
+        role="some_image",
+        instance_groups=[
+            InstanceGroup("group1", "ml.c4.xlarge", 1),
+            InstanceGroup("group2", "ml.p3.16xlarge", 2),
+        ],
+        sagemaker_session=sagemaker_session,
+        base_job_name="base_job_name",
+    )
+
+    assert "ml.p3.16xlarge" == estimator._get_instance_type()
+
+
+def test_get_instance_type_cpu(sagemaker_session):
+    estimator = Estimator(
+        image_uri="some-image",
+        role="some_image",
+        instance_groups=[
+            InstanceGroup("group1", "ml.c4.xlarge", 1),
+            InstanceGroup("group2", "ml.c5.xlarge", 2),
+        ],
+        sagemaker_session=sagemaker_session,
+        base_job_name="base_job_name",
+    )
+
+    assert "ml.c4.xlarge" == estimator._get_instance_type()
+
+
+def test_get_instance_type_no_instance_groups(sagemaker_session):
+    estimator = Estimator(
+        image_uri="some-image",
+        role="some_image",
+        instance_type="ml.c4.xlarge",
+        instance_count=1,
+        sagemaker_session=sagemaker_session,
+        base_job_name="base_job_name",
+    )
+
+    assert "ml.c4.xlarge" == estimator._get_instance_type()
+
+
+def test_get_instance_type_no_instance_groups_or_instance_type(sagemaker_session):
+    estimator = Estimator(
+        image_uri="some-image",
+        role="some_image",
+        instance_type=None,
+        instance_count=None,
+        instance_groups=None,
+        sagemaker_session=sagemaker_session,
+        base_job_name="base_job_name",
+    )
+    with pytest.raises(ValueError) as error:
+        estimator._get_instance_type()
+
+    assert (
+        "instance_groups must be set if instance_type is not set and instance_groups must be a list."
+        in str(error)
+    )
 
 
 def test_augmented_manifest(sagemaker_session):
@@ -2575,6 +2806,7 @@ def test_generic_to_fit_no_input(time, sagemaker_session):
 
     args.pop("job_name")
     args.pop("role")
+    args.pop("debugger_hook_config")
 
     assert args == NO_INPUT_TRAIN_CALL
 
@@ -2599,6 +2831,7 @@ def test_generic_to_fit_no_hps(time, sagemaker_session):
 
     args.pop("job_name")
     args.pop("role")
+    args.pop("debugger_hook_config")
 
     assert args == BASE_TRAIN_CALL
 
@@ -2625,6 +2858,7 @@ def test_generic_to_fit_with_hps(time, sagemaker_session):
 
     args.pop("job_name")
     args.pop("role")
+    args.pop("debugger_hook_config")
 
     assert args == HP_TRAIN_CALL
 
@@ -2656,6 +2890,7 @@ def test_generic_to_fit_with_experiment_config(time, sagemaker_session):
 
     args.pop("job_name")
     args.pop("role")
+    args.pop("debugger_hook_config")
 
     assert args == EXP_TRAIN_CALL
 
@@ -2809,6 +3044,7 @@ def test_generic_to_deploy(time, sagemaker_session):
 
     args.pop("job_name")
     args.pop("role")
+    args.pop("debugger_hook_config")
 
     assert args == HP_TRAIN_CALL
 
@@ -3090,6 +3326,12 @@ def test_register_default_image(sagemaker_session):
     response_types = ["application/json"]
     inference_instances = ["ml.m4.xlarge"]
     transform_instances = ["ml.m4.xlarget"]
+    sample_payload_url = "s3://test-bucket/model"
+    task = "IMAGE_CLASSIFICATION"
+    framework = "TENSORFLOW"
+    framework_version = "2.9"
+    nearest_model_name = "resnet50"
+    data_input_config = '{"input_1":[1,224,224,3]}'
 
     estimator.register(
         content_types=content_types,
@@ -3097,6 +3339,12 @@ def test_register_default_image(sagemaker_session):
         inference_instances=inference_instances,
         transform_instances=transform_instances,
         model_package_name=model_package_name,
+        sample_payload_url=sample_payload_url,
+        task=task,
+        framework=framework,
+        framework_version=framework_version,
+        nearest_model_name=nearest_model_name,
+        data_input_configuration=data_input_config,
     )
     sagemaker_session.create_model.assert_not_called()
 
@@ -3113,6 +3361,62 @@ def test_register_default_image(sagemaker_session):
         "transform_instances": transform_instances,
         "model_package_name": model_package_name,
         "marketplace_cert": False,
+        "sample_payload_url": sample_payload_url,
+        "task": task,
+    }
+    sagemaker_session.create_model_package_from_containers.assert_called_with(
+        **expected_create_model_package_request
+    )
+
+
+def test_register_default_image_without_instance_type_args(sagemaker_session):
+    estimator = Estimator(
+        IMAGE_URI,
+        ROLE,
+        INSTANCE_COUNT,
+        INSTANCE_TYPE,
+        output_path=OUTPUT_PATH,
+        sagemaker_session=sagemaker_session,
+    )
+    estimator.set_hyperparameters(**HYPERPARAMS)
+    estimator.fit({"train": "s3://bucket/training-prefix"})
+
+    model_package_name = "test-estimator-register-model"
+    content_types = ["application/json"]
+    response_types = ["application/json"]
+    sample_payload_url = "s3://test-bucket/model"
+    task = "IMAGE_CLASSIFICATION"
+    framework = "TENSORFLOW"
+    framework_version = "2.9"
+    nearest_model_name = "resnet50"
+
+    estimator.register(
+        content_types=content_types,
+        response_types=response_types,
+        model_package_name=model_package_name,
+        sample_payload_url=sample_payload_url,
+        task=task,
+        framework=framework,
+        framework_version=framework_version,
+        nearest_model_name=nearest_model_name,
+    )
+    sagemaker_session.create_model.assert_not_called()
+
+    expected_create_model_package_request = {
+        "containers": [
+            {
+                "Image": estimator.image_uri,
+                "ModelDataUrl": estimator.model_data,
+            }
+        ],
+        "content_types": content_types,
+        "response_types": response_types,
+        "inference_instances": None,
+        "transform_instances": None,
+        "model_package_name": model_package_name,
+        "marketplace_cert": False,
+        "sample_payload_url": sample_payload_url,
+        "task": task,
     }
     sagemaker_session.create_model_package_from_containers.assert_called_with(
         **expected_create_model_package_request
@@ -3137,6 +3441,11 @@ def test_register_inference_image(sagemaker_session):
     inference_instances = ["ml.m4.xlarge"]
     transform_instances = ["ml.m4.xlarget"]
     inference_image = "fake-inference-image"
+    sample_payload_url = "s3://test-bucket/model"
+    task = "IMAGE_CLASSIFICATION"
+    framework = "TENSORFLOW"
+    framework_version = "2.9"
+    nearest_model_name = "resnet50"
 
     estimator.register(
         content_types=content_types,
@@ -3144,7 +3453,12 @@ def test_register_inference_image(sagemaker_session):
         inference_instances=inference_instances,
         transform_instances=transform_instances,
         model_package_name=model_package_name,
+        sample_payload_url=sample_payload_url,
+        task=task,
         image_uri=inference_image,
+        framework=framework,
+        framework_version=framework_version,
+        nearest_model_name=nearest_model_name,
     )
     sagemaker_session.create_model.assert_not_called()
 
@@ -3161,10 +3475,39 @@ def test_register_inference_image(sagemaker_session):
         "transform_instances": transform_instances,
         "model_package_name": model_package_name,
         "marketplace_cert": False,
+        "sample_payload_url": sample_payload_url,
+        "task": task,
     }
     sagemaker_session.create_model_package_from_containers.assert_called_with(
         **expected_create_model_package_request
     )
+
+
+def test_register_under_pipeline_session(pipeline_session):
+    estimator = Estimator(
+        IMAGE_URI,
+        ROLE,
+        INSTANCE_COUNT,
+        INSTANCE_TYPE,
+        output_path=OUTPUT_PATH,
+        sagemaker_session=pipeline_session,
+    )
+
+    model_package_name = "test-estimator-register-model"
+    content_types = ["application/json"]
+    response_types = ["application/json"]
+    inference_instances = ["ml.m4.xlarge"]
+    transform_instances = ["ml.m4.xlarget"]
+
+    with pytest.raises(TypeError) as error:
+        estimator.register(
+            content_types=content_types,
+            response_types=response_types,
+            inference_instances=inference_instances,
+            transform_instances=transform_instances,
+            model_package_name=model_package_name,
+        )
+    assert "estimator.register does not support PipelineSession" in str(error.value)
 
 
 @patch("sagemaker.estimator.LocalSession")
@@ -3501,6 +3844,12 @@ def test_script_mode_estimator_same_calls_as_framework(
 
     model_uri = "s3://someprefix2/models/model.tar.gz"
     training_data_uri = "s3://bucket/mydata"
+    hyperparameters = {
+        "int_hyperparam": 1,
+        "string_hyperparam": "hello",
+        "stringified_numeric_hyperparam": "44",
+        "float_hyperparam": 1.234,
+    }
 
     generic_estimator = Estimator(
         entry_point=SCRIPT_PATH,
@@ -3512,9 +3861,9 @@ def test_script_mode_estimator_same_calls_as_framework(
         source_dir=script_uri,
         image_uri=IMAGE_URI,
         model_uri=model_uri,
-        environment={"USE_SMDEBUG": "0"},
         dependencies=[],
         debugger_hook_config={},
+        hyperparameters=deepcopy(hyperparameters),
     )
     generic_estimator.fit(training_data_uri)
 
@@ -3535,6 +3884,7 @@ def test_script_mode_estimator_same_calls_as_framework(
         model_uri=model_uri,
         dependencies=[],
         debugger_hook_config={},
+        hyperparameters=deepcopy(hyperparameters),
     )
     framework_estimator.fit(training_data_uri)
 
@@ -4000,3 +4350,122 @@ def test_all_framework_estimators_add_jumpstart_base_name(
         sagemaker_session.endpoint_from_production_variants.reset_mock()
         sagemaker_session.create_model.reset_mock()
         sagemaker_session.train.reset_mock()
+
+
+def test_insert_invalid_source_code_args():
+    with pytest.raises(TypeError) as err:
+        Estimator(
+            image_uri="IMAGE_URI",
+            role=ROLE,
+            entry_point=ParameterString(name="EntryPoint"),
+            instance_type="ml.m5.xlarge",
+            instance_count=1,
+            enable_network_isolation=True,
+        )
+    assert (
+        "entry_point, source_dir should not be pipeline variables "
+        "when enable_network_isolation is a pipeline variable or it is set to True."
+    ) in str(err.value)
+
+    with pytest.raises(TypeError) as err:
+        Estimator(
+            image_uri="IMAGE_URI",
+            role=ROLE,
+            entry_point="dummy.py",
+            source_dir=ParameterString(name="SourceDir"),
+            instance_type="ml.m5.xlarge",
+            instance_count=1,
+            enable_network_isolation=ParameterBoolean(name="EnableNetworkIsolation"),
+        )
+    assert (
+        "entry_point, source_dir should not be pipeline variables "
+        "when enable_network_isolation is a pipeline variable or it is set to True."
+    ) in str(err.value)
+
+    with pytest.raises(TypeError) as err:
+        Estimator(
+            image_uri=IMAGE_URI,
+            role=ROLE,
+            git_config={"repo": GIT_REPO, "branch": BRANCH, "commit": COMMIT},
+            source_dir=ParameterString(name="SourceDir"),
+            entry_point=ParameterString(name="EntryPoint"),
+            instance_type="ml.m5.xlarge",
+            instance_count=1,
+        )
+    assert (
+        "entry_point, source_dir should not be pipeline variables when git_config is given"
+        in str(err.value)
+    )
+
+    with pytest.raises(TypeError) as err:
+        Estimator(
+            image_uri=IMAGE_URI,
+            role=ROLE,
+            entry_point=ParameterString(name="EntryPoint"),
+            instance_type="ml.m5.xlarge",
+            instance_count=1,
+        )
+    assert "The entry_point should not be a pipeline variable when source_dir is missing" in str(
+        err.value
+    )
+
+    with pytest.raises(TypeError) as err:
+        Estimator(
+            image_uri="IMAGE_URI",
+            role=ROLE,
+            entry_point=ParameterString(name="EntryPoint"),
+            source_dir="file://my-file/",
+            instance_type="ml.m5.xlarge",
+            instance_count=1,
+        )
+    assert (
+        "The entry_point should not be a pipeline variable " "when source_dir is a local path"
+    ) in str(err.value)
+
+
+@patch("time.time", return_value=TIME)
+@patch("sagemaker.estimator.tar_and_upload_dir")
+@patch("sagemaker.model.Model._upload_code")
+def test_script_mode_estimator_escapes_hyperparameters_as_json(
+    patched_upload_code, patched_tar_and_upload_dir, sagemaker_session
+):
+    patched_tar_and_upload_dir.return_value = UploadedCode(
+        s3_prefix="s3://%s/%s" % ("bucket", "key"), script_name="script_name"
+    )
+    sagemaker_session.boto_region_name = REGION
+
+    instance_type = "ml.p2.xlarge"
+    instance_count = 1
+
+    training_data_uri = "s3://bucket/mydata"
+
+    jumpstart_source_dir = f"s3://{list(JUMPSTART_BUCKET_NAME_SET)[0]}/source_dirs/source.tar.gz"
+
+    hyperparameters = {
+        "int_hyperparam": 1,
+        "string_hyperparam": "hello",
+        "stringified_numeric_hyperparam": "44",
+        "float_hyperparam": 1.234,
+    }
+
+    generic_estimator = Estimator(
+        entry_point=SCRIPT_PATH,
+        role=ROLE,
+        region=REGION,
+        sagemaker_session=sagemaker_session,
+        instance_count=instance_count,
+        instance_type=instance_type,
+        source_dir=jumpstart_source_dir,
+        image_uri=IMAGE_URI,
+        model_uri=MODEL_DATA,
+        hyperparameters=hyperparameters,
+    )
+    generic_estimator.fit(training_data_uri)
+
+    formatted_hyperparams = EstimatorBase._json_encode_hyperparameters(hyperparameters)
+
+    assert (
+        set(formatted_hyperparams.items())
+        - set(sagemaker_session.train.call_args_list[0][1]["hyperparameters"].items())
+        == set()
+    )

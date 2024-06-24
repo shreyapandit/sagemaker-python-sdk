@@ -19,6 +19,7 @@ import json
 import logging
 
 from enum import Enum
+from typing import Union, Dict, Optional, List, Set
 
 import sagemaker
 from sagemaker.amazon.amazon_estimator import (
@@ -29,20 +30,21 @@ from sagemaker.amazon.amazon_estimator import (
 from sagemaker.amazon.hyperparameter import Hyperparameter as hp  # noqa
 from sagemaker.analytics import HyperparameterTuningJobAnalytics
 from sagemaker.deprecations import removed_function
-from sagemaker.estimator import Framework
-from sagemaker.inputs import TrainingInput
+from sagemaker.estimator import Framework, EstimatorBase
+from sagemaker.inputs import TrainingInput, FileSystemInput
 from sagemaker.job import _Job
+from sagemaker.jumpstart.utils import add_jumpstart_tags, get_jumpstart_base_name_if_jumpstart_model
 from sagemaker.parameter import (
     CategoricalParameter,
     ContinuousParameter,
     IntegerParameter,
     ParameterRange,
 )
+from sagemaker.workflow.entities import PipelineVariable
 from sagemaker.workflow.pipeline_context import runnable_by_pipeline
 
 from sagemaker.session import Session
-from sagemaker.utils import base_from_name, base_name_from_image, name_from_base
-from sagemaker.workflow import is_pipeline_variable
+from sagemaker.utils import base_from_name, base_name_from_image, name_from_base, to_string
 
 AMAZON_ESTIMATOR_MODULE = "sagemaker"
 AMAZON_ESTIMATOR_CLS_NAMES = {
@@ -94,14 +96,18 @@ class WarmStartConfig(object):
         {"p1","p2"}
     """
 
-    def __init__(self, warm_start_type, parents):
+    def __init__(
+        self,
+        warm_start_type: WarmStartTypes,
+        parents: Set[Union[str, PipelineVariable]],
+    ):
         """Creates a ``WarmStartConfig`` with provided ``WarmStartTypes`` and parents.
 
         Args:
             warm_start_type (sagemaker.tuner.WarmStartTypes): This should be one
                 of the supported warm start types in WarmStartType
-            parents (set{str}): Set of parent tuning jobs which will be used to
-                warm start the new tuning job.
+            parents (set[str] or set[PipelineVariable]): Set of parent tuning jobs which
+                will be used to warm start the new tuning job.
         """
 
         if warm_start_type not in list(WarmStartTypes):
@@ -207,19 +213,19 @@ class HyperparameterTuner(object):
 
     def __init__(
         self,
-        estimator,
-        objective_metric_name,
-        hyperparameter_ranges,
-        metric_definitions=None,
-        strategy="Bayesian",
-        objective_type="Maximize",
-        max_jobs=1,
-        max_parallel_jobs=1,
-        tags=None,
-        base_tuning_job_name=None,
-        warm_start_config=None,
-        early_stopping_type="Off",
-        estimator_name=None,
+        estimator: EstimatorBase,
+        objective_metric_name: Union[str, PipelineVariable],
+        hyperparameter_ranges: Dict[str, ParameterRange],
+        metric_definitions: Optional[List[Dict[str, Union[str, PipelineVariable]]]] = None,
+        strategy: Union[str, PipelineVariable] = "Bayesian",
+        objective_type: Union[str, PipelineVariable] = "Maximize",
+        max_jobs: Union[int, PipelineVariable] = 1,
+        max_parallel_jobs: Union[int, PipelineVariable] = 1,
+        tags: Optional[List[Dict[str, Union[str, PipelineVariable]]]] = None,
+        base_tuning_job_name: Optional[str] = None,
+        warm_start_config: Optional[WarmStartConfig] = None,
+        early_stopping_type: Union[str, PipelineVariable] = "Off",
+        estimator_name: Optional[str] = None,
     ):
         """Creates a ``HyperparameterTuner`` instance.
 
@@ -231,7 +237,7 @@ class HyperparameterTuner(object):
                 that has been initialized with the desired configuration. There
                 does not need to be a training job associated with this
                 instance.
-            objective_metric_name (str): Name of the metric for evaluating
+            objective_metric_name (str or PipelineVariable): Name of the metric for evaluating
                 training jobs.
             hyperparameter_ranges (dict[str, sagemaker.parameter.ParameterRange]): Dictionary of
                 parameter ranges. These parameter ranges can be one
@@ -239,24 +245,24 @@ class HyperparameterTuner(object):
                 the dictionary are the names of the hyperparameter, and the
                 values are the appropriate parameter range class to represent
                 the range.
-            metric_definitions (list[dict]): A list of dictionaries that defines
-                the metric(s) used to evaluate the training jobs (default:
+            metric_definitions (list[dict[str, str] or list[dict[str, PipelineVariable]]): A list of
+                dictionaries that defines the metric(s) used to evaluate the training jobs (default:
                 None). Each dictionary contains two keys: 'Name' for the name of
                 the metric, and 'Regex' for the regular expression used to
                 extract the metric from the logs. This should be defined only
                 for hyperparameter tuning jobs that don't use an Amazon
                 algorithm.
-            strategy (str): Strategy to be used for hyperparameter estimations
+            strategy (str or PipelineVariable): Strategy to be used for hyperparameter estimations
                 (default: 'Bayesian').
-            objective_type (str): The type of the objective metric for
+            objective_type (str or PipelineVariable): The type of the objective metric for
                 evaluating training jobs. This value can be either 'Minimize' or
                 'Maximize' (default: 'Maximize').
-            max_jobs (int): Maximum total number of training jobs to start for
+            max_jobs (int or PipelineVariable): Maximum total number of training jobs to start for
                 the hyperparameter tuning job (default: 1).
-            max_parallel_jobs (int): Maximum number of parallel training jobs to
+            max_parallel_jobs (int or PipelineVariable): Maximum number of parallel training jobs to
                 start (default: 1).
-            tags (list[dict]): List of tags for labeling the tuning job
-                (default: None). For more, see
+            tags (list[dict[str, str] or list[dict[str, PipelineVariable]]): List of tags for
+                labeling the tuning job (default: None). For more, see
                 https://docs.aws.amazon.com/sagemaker/latest/dg/API_Tag.html.
             base_tuning_job_name (str): Prefix for the hyperparameter tuning job
                 name when the :meth:`~sagemaker.tuner.HyperparameterTuner.fit`
@@ -266,7 +272,7 @@ class HyperparameterTuner(object):
             warm_start_config (sagemaker.tuner.WarmStartConfig): A
                 ``WarmStartConfig`` object that has been initialized with the
                 configuration defining the nature of warm start tuning job.
-            early_stopping_type (str): Specifies whether early stopping is
+            early_stopping_type (str or PipelineVariable): Specifies whether early stopping is
                 enabled for the job. Can be either 'Auto' or 'Off' (default:
                 'Off'). If set to 'Off', early stopping will not be attempted.
                 If set to 'Auto', early stopping of some training jobs may
@@ -319,6 +325,42 @@ class HyperparameterTuner(object):
         """Prepare the tuner instance for tuning (fit)."""
         self._prepare_job_name_for_tuning(job_name=job_name)
         self._prepare_static_hyperparameters_for_tuning(include_cls_metadata=include_cls_metadata)
+        self._prepare_tags_for_tuning()
+
+    def _get_model_uri(
+        self,
+        estimator,
+    ):
+        """Return the model artifact URI used by the Estimator instance.
+
+        This attribute can live in multiple places, and accessing the attribute can
+        raise a TypeError, which needs to be handled.
+        """
+        try:
+            return getattr(estimator, "model_data", None)
+        except TypeError:
+            return getattr(estimator, "model_uri", None)
+
+    def _prepare_tags_for_tuning(self):
+        """Add tags to tuning job (from Estimator and JumpStart tags)."""
+
+        # Add tags from Estimator class
+        estimator = self.estimator or self.estimator_dict[sorted(self.estimator_dict.keys())[0]]
+
+        estimator_tags = getattr(estimator, "tags", []) or []
+
+        if self.tags is None and len(estimator_tags) > 0:
+            self.tags = []
+
+        for tag in estimator_tags:
+            if tag not in self.tags:
+                self.tags.append(tag)
+
+        self.tags = add_jumpstart_tags(
+            tags=self.tags,
+            training_script_uri=getattr(estimator, "source_dir", None),
+            training_model_uri=self._get_model_uri(estimator),
+        )
 
     def _prepare_job_name_for_tuning(self, job_name=None):
         """Set current job name before starting tuning."""
@@ -330,7 +372,15 @@ class HyperparameterTuner(object):
                 estimator = (
                     self.estimator or self.estimator_dict[sorted(self.estimator_dict.keys())[0]]
                 )
-                base_name = base_name_from_image(estimator.training_image_uri())
+                base_name = base_name_from_image(
+                    estimator.training_image_uri(), default_base_name=EstimatorBase.JOB_CLASS_NAME
+                )
+
+                jumpstart_base_name = get_jumpstart_base_name_if_jumpstart_model(
+                    getattr(estimator, "source_dir", None),
+                    self._get_model_uri(estimator),
+                )
+                base_name = jumpstart_base_name or base_name
             self._current_job_name = name_from_base(
                 base_name, max_length=self.TUNING_JOB_NAME_MAX_LENGTH, short=True
             )
@@ -363,8 +413,7 @@ class HyperparameterTuner(object):
         """Prepare static hyperparameters for one estimator before tuning."""
         # Remove any hyperparameter that will be tuned
         static_hyperparameters = {
-            str(k): str(v) if not is_pipeline_variable(v) else v.to_string()
-            for (k, v) in estimator.hyperparameters().items()
+            str(k): to_string(v) for (k, v) in estimator.hyperparameters().items()
         }
         for hyperparameter_name in hyperparameter_ranges.keys():
             static_hyperparameters.pop(hyperparameter_name, None)
@@ -384,11 +433,13 @@ class HyperparameterTuner(object):
     @runnable_by_pipeline
     def fit(
         self,
-        inputs=None,
-        job_name=None,
-        include_cls_metadata=False,
-        estimator_kwargs=None,
-        wait=True,
+        inputs: Optional[
+            Union[str, Dict, List, TrainingInput, FileSystemInput, RecordSet, FileSystemRecordSet]
+        ] = None,
+        job_name: Optional[str] = None,
+        include_cls_metadata: Union[bool, Dict[str, bool]] = False,
+        estimator_kwargs: Optional[Dict[str, dict]] = None,
+        wait: bool = True,
         **kwargs
     ):
         """Start a hyperparameter tuning job.
